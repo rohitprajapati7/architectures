@@ -1,0 +1,461 @@
+# FacctList Bulk Service — Architecture Diagram
+
+## Service Overview
+
+**facctlist-bulk-service** is an event-driven, short-lived background processor (not a REST API) that handles bulk upload operations for FacctList internal lists (Blocklists and Press Release lists). It is spawned as a Kubernetes Job per bulk upload request, processes an Excel file from S3, validates/deduplicates records, persists them to databases, initiates approval workflows, and exits.
+
+---
+
+## High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          KUBERNETES CLUSTER (facctlist namespace)                │
+│                                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────────┐   │
+│  │                    facctlist-bulk-service (K8s Job)                       │   │
+│  │                    Node.js 22 | 750MB Memory Limit                       │   │
+│  │                                                                          │   │
+│  │  ┌──────────────┐    ┌──────────────────────────────────────────────┐    │   │
+│  │  │  index.js     │───▶│         BulkUploadMediator                  │    │   │
+│  │  │  (Entry Point)│    │     (EventEmitter + Stack-based FSM)        │    │   │
+│  │  └──────────────┘    │                                              │    │   │
+│  │         │             │  Event Flow (sequential via Stack):         │    │   │
+│  │         ▼             │                                              │    │   │
+│  │  ┌──────────────┐    │  1. INIT_JOB_DATA ──────────────────────┐   │    │   │
+│  │  │  config.js   │    │  2. READ_BULK_FORM                      │   │    │   │
+│  │  │  database.js │    │  3. VALIDATE_FILE                       │   │    │   │
+│  │  │  (Init PG +  │    │  4. DEDUP_CHECK                         │   │    │   │
+│  │  │   MongoDB)   │    │  5. UPDATE_DB                           │   │    │   │
+│  │  └──────────────┘    │  6. [INITIATE_TASK_WORKFLOW]*            │   │    │   │
+│  │                       │  7. [UPDATE_WORKFLOW_DATA]*              │   │    │   │
+│  │                       │  8. COMMIT_TRANSACTION                   │   │    │   │
+│  │                       │  9. SEND_NOTIFICATION                    │   │    │   │
+│  │                       │ 10. CLOSE (process.exit)                 │   │    │   │
+│  │                       │                                          │   │    │   │
+│  │                       │  * Only for non-pre-approved records     │   │    │   │
+│  │                       │                                          │   │    │   │
+│  │                       │  On Error: ERROR_ROLLBACK ──▶ abort txn  │   │    │   │
+│  │                       │            ──▶ update job status FAILED   │   │    │   │
+│  │                       │            ──▶ process.exit(0)            │   │    │   │
+│  │                       └──────────────────────────────────────────────┘    │   │
+│  └───────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Event Processor Pipeline (Detailed)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│   ┌─────────────────┐                                                           │
+│   │ 1. INIT_JOB_DATA│   db.processor.js                                        │
+│   │   (fetchInitData)│──▶ Fetch job details from PostgreSQL (job_run_status)    │
+│   │                  │──▶ Fetch tenant attribute config (validation rules)       │
+│   │                  │──▶ Fetch reference data (tags, entity types, etc.)        │
+│   │                  │──▶ Fetch user details via CAP Service                     │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 2. READ_BULK    │   readBulkForm.processor.js                               │
+│   │    FORM         │──▶ Download Excel file from S3 (via Storage Service)      │
+│   │                 │──▶ Parse multi-sheet workbook (ExcelJS streaming)          │
+│   │                 │──▶ Extract cell data per entity type sheet                 │
+│   │                 │──▶ Skip static sheets (Reference Data, Lists)             │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 3. VALIDATE_FILE│   fileValidation.processor.js                             │
+│   │                 │──▶ Validate column headers against config                 │
+│   │                 │──▶ Validate entity types configured for list              │
+│   │                 │──▶ Per-record validation:                                 │
+│   │                 │    • Mandatory fields (action type, record ref, entry type)│
+│   │                 │    • Min/max length constraints                            │
+│   │                 │    • Regex pattern matching                                │
+│   │                 │    • Date format/range validation                          │
+│   │                 │    • Reference data lookups (tags, reason codes)           │
+│   │                 │    • Primary/Linked record relationship validation         │
+│   │                 │──▶ Intra-sheet & cross-sheet duplicate detection           │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 4. DEDUP_CHECK  │   dedupCheck.processor.js                                │
+│   │                 │──▶ Skip if: errors exist, no records, or pre-approved     │
+│   │                 │──▶ Extract identity keys (names, IDs) from records        │
+│   │                 │──▶ Batch search against existing DB records               │
+│   │                 │──▶ Mark potential duplicates (isDedupCheck flag)           │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 5. UPDATE_DB    │   db.processor.js (updateDbProcesser)                     │
+│   │                 │──▶ Skip if validation errors exist                        │
+│   │                 │──▶ Start MongoDB transaction                              │
+│   │                 │──▶ Process records by action type:                        │
+│   │                 │    • ADD: Insert to stage + master tables                  │
+│   │                 │    • AMEND: Update existing records                        │
+│   │                 │    • DELETE: Soft-delete records                           │
+│   │                 │──▶ Handle internal list counters                          │
+│   │                 │──▶ Batch processing (configurable batch size)             │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐   (Only for non-pre-approved records)                     │
+│   │ 6. INITIATE     │   taskWorkflow.processor.js                               │
+│   │    TASK_WORKFLOW │──▶ Call Case Manager Service (bulk workflow initiation)   │
+│   │                 │──▶ Chunk records (100 per request)                        │
+│   │                 │──▶ Create approval tasks with SLA dates                   │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 7. UPDATE       │   updateWorkFlowData.processor.js                         │
+│   │    WORKFLOW_DATA │──▶ Map workflow IDs back to records                      │
+│   │                 │──▶ Update stage records with wfId, wfExeId, SLA dates    │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 8. COMMIT       │   bulkUpload.mediator.js (#commitTransaction)             │
+│   │    TRANSACTION   │──▶ Commit MongoDB session                               │
+│   │                 │──▶ Calculate transaction summary                          │
+│   │                 │──▶ Generate error report Excel (if errors) → upload to S3 │
+│   │                 │──▶ Update job_run_status with final results               │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 9. SEND         │   notification.processor.js                               │
+│   │    NOTIFICATION  │──▶ POST to Notification Service (success/failure)        │
+│   │                 │──▶ Publish audit logs to NATS queue                       │
+│   └────────┬────────┘                                                           │
+│            ▼                                                                    │
+│   ┌─────────────────┐                                                           │
+│   │ 10. CLOSE       │──▶ Remove all event listeners                            │
+│   │                 │──▶ process.exit(0)                                        │
+│   └─────────────────┘                                                           │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## External Service Integration Map
+
+```
+                                    ┌──────────────────────┐
+                                    │   facctlist-api       │
+                                    │   (Triggers bulk job  │
+                                    │    via K8s Job/Env)   │
+                                    └──────────┬───────────┘
+                                               │ JOB_ID via env var
+                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│                        facctlist-bulk-service                                 │
+│                                                                              │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│   │  Excel Parser │  │  Validator   │  │  Dedup Engine│  │  DB Writer   │   │
+│   │  (ExcelJS)   │  │  (Config-    │  │  (Identity   │  │  (Mongo +    │   │
+│   │              │  │   driven)    │  │   key match) │  │   Postgres)  │   │
+│   └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
+│                                                                              │
+└──────┬──────────┬──────────┬──────────┬──────────┬──────────┬───────────────┘
+       │          │          │          │          │          │
+       ▼          ▼          ▼          ▼          ▼          ▼
+┌──────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────────┐
+│  AWS S3  │ │Postgres│ │MongoDB │ │  NATS  │ │Notif.  │ │Case Manager  │
+│          │ │  (RDS) │ │        │ │(Queue) │ │Service │ │  Service     │
+│ • Read   │ │        │ │        │ │        │ │        │ │              │
+│   Excel  │ │ Tables:│ │ Colls: │ │Publish:│ │ POST   │ │ POST         │
+│   files  │ │ • job_ │ │ • il_  │ │ • audit│ │ /notify│ │ /workflow/   │
+│ • Upload │ │   run_ │ │   record│ │   logs │ │        │ │  bulkInitiate│
+│   error  │ │   status│ │   _stage│ │        │ │        │ │              │
+│   reports│ │ • il_  │ │ • il_  │ │        │ │        │ │ Auth: Basic  │
+│          │ │   attr_│ │   record│ │        │ │ Auth:  │ │ Headers:     │
+│ Auth:    │ │   config│ │   _master│ │       │ │ Basic  │ │ x-tenant-id  │
+│ IAM Role │ │ • tenant│ │ • il_  │ │        │ │        │ │ x-user-id    │
+│          │ │   _ref_ │ │   counter│ │       │ │        │ │ x-product-id │
+│          │ │   data │ │        │ │        │ │        │ │              │
+│          │ │ • watch │ │        │ │        │ │        │ │              │
+│          │ │   list_ │ │        │ │        │ │        │ │              │
+│          │ │   pref  │ │        │ │        │ │        │ │              │
+└──────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────────────┘
+```
+
+---
+
+## Data Flow Diagram
+
+```
+                    ┌─────────────┐
+                    │  Excel File │
+                    │  (.xlsx)    │
+                    │  in AWS S3  │
+                    └──────┬──────┘
+                           │ Download (Facctum Storage Service)
+                           ▼
+                    ┌─────────────┐
+                    │  ExcelJS    │
+                    │  Stream     │──── Memory-optimized parsing
+                    │  Parser     │     (ignoreNodes: styles, dataValidations)
+                    └──────┬──────┘
+                           │ Multi-sheet extraction
+                           ▼
+              ┌────────────────────────┐
+              │  Sheet Data per Entity │
+              │  (Person, Entity, etc.)│
+              │                        │
+              │  Skipped: "Reference   │
+              │  Data", "Lists" sheets │
+              └────────────┬───────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Validation Engine     │
+              │                        │
+              │  Config-driven rules:  │
+              │  ┌──────────────────┐  │
+              │  │ tenant_attribute │  │
+              │  │ _config (PG)    │  │
+              │  └──────────────────┘  │
+              │                        │
+              │  • Column validation   │
+              │  • Mandatory fields    │
+              │  • Length constraints   │
+              │  • Regex patterns      │
+              │  • Date validation     │
+              │  • Ref data lookups    │
+              │  • Duplicate detection │
+              └──────┬─────────┬───────┘
+                     │         │
+              ┌──────┘         └──────┐
+              ▼                       ▼
+     ┌──────────────┐       ┌──────────────┐
+     │  Valid Records│       │  Errors      │
+     │  (continue)  │       │  (→ Error    │
+     └──────┬───────┘       │   Report     │
+            │               │   Excel →S3) │
+            ▼               └──────────────┘
+     ┌──────────────┐
+     │  Dedup Check │
+     │  (Batch      │
+     │   identity   │
+     │   key search)│
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────────────────────────────┐
+     │  Database Operations (MongoDB Txn)   │
+     │                                      │
+     │  ADD    ──▶ Insert stage + master    │
+     │  AMEND  ──▶ Update existing records  │
+     │  DELETE ──▶ Soft-delete records      │
+     │                                      │
+     │  Tables: il_record_stage,            │
+     │          il_record_master,           │
+     │          il_counter                  │
+     └──────────────┬───────────────────────┘
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+          ▼                   ▼
+   ┌─────────────┐    ┌─────────────┐
+   │Pre-Approved │    │Non-Pre-     │
+   │(skip WF)    │    │Approved     │
+   └──────┬──────┘    └──────┬──────┘
+          │                  │
+          │                  ▼
+          │           ┌─────────────┐
+          │           │Case Manager │
+          │           │bulkInitiate │
+          │           │(100/chunk)  │
+          │           └──────┬──────┘
+          │                  │
+          │                  ▼
+          │           ┌─────────────┐
+          │           │Update Stage │
+          │           │Records with │
+          │           │wfId, wfExeId│
+          │           │SLA dates    │
+          │           └──────┬──────┘
+          │                  │
+          └────────┬─────────┘
+                   ▼
+          ┌──────────────────┐
+          │ Commit MongoDB   │
+          │ Transaction      │
+          │                  │
+          │ Update job_run_  │
+          │ status (PG)      │
+          │ with summary     │
+          └────────┬─────────┘
+                   ▼
+          ┌──────────────────┐       ┌──────────────────┐
+          │ Notification     │──────▶│ Notification     │
+          │ Service (HTTP)   │       │ Service          │
+          └────────┬─────────┘       └──────────────────┘
+                   │
+                   ▼
+          ┌──────────────────┐       ┌──────────────────┐
+          │ Audit Logs       │──────▶│ NATS Queue       │
+          │ (per record)     │       │ (audit-log-stream)│
+          └──────────────────┘       └──────────────────┘
+```
+
+---
+
+## Database Schema Overview
+
+### PostgreSQL (Sequelize ORM)
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│    job_run_status        │     │    job_err_dtl           │
+│─────────────────────────│     │─────────────────────────│
+│ jobId (PK)              │     │ jobId (FK)              │
+│ tenantId                │◄────│ errorDescription        │
+│ listId                  │     │ rowNumber               │
+│ listTypeId              │     │ columnName              │
+│ actionId                │     │ entityTypeName          │
+│ versionNumber           │     └─────────────────────────┘
+│ runStatusId             │
+│ addedUserId             │     ┌─────────────────────────┐
+│ startDateTime           │     │  tenant_attribute_config │
+│ endDateTime             │     │─────────────────────────│
+│ totalRunTime            │     │ tenantId                │
+│ totalRecords            │     │ listId                  │
+│ validationPassed        │     │ listTypeId              │
+│ validationFailed        │     │ attributeName           │
+│ potentialDuplicates     │     │ isMandatory             │
+│ errorReportFilePath     │     │ minLength / maxLength   │
+│ isPreApprovedFlag       │     │ regex                   │
+└─────────────────────────┘     │ validationParameters[]  │
+                                └─────────────────────────┘
+┌─────────────────────────┐
+│  tenant_reference_data   │     ┌─────────────────────────┐
+│─────────────────────────│     │  internal_list_master    │
+│ tenantId                │     │─────────────────────────│
+│ refId                   │     │ listId                  │
+│ values[] (tags, reasons,│     │ listTypeId              │
+│  entity types, etc.)    │     │ tenantId                │
+└─────────────────────────┘     │ recordReasonId          │
+                                └─────────────────────────┘
+┌─────────────────────────┐
+│  watch_list_pref_master  │     ┌─────────────────────────┐
+│─────────────────────────│     │  internal_list_tag       │
+│ (Watchlist preferences) │     │─────────────────────────│
+└─────────────────────────┘     │ (Tag associations)      │
+                                └─────────────────────────┘
+```
+
+### MongoDB (Mongoose)
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  il_record_stage         │     │  il_record_master        │
+│  (screenDB)             │     │  (screenDB)             │
+│─────────────────────────│     │─────────────────────────│
+│ tenantId                │     │ tenantId                │
+│ listId                  │     │ listId                  │
+│ recordReferenceNumber   │     │ recordReferenceNumber   │
+│ entryType               │     │ entryType               │
+│ actionId                │     │ actionId                │
+│ attributes{}            │     │ attributes{}            │
+│ wfId                    │     │ versionNumber           │
+│ wfExeId                 │     │ statusId                │
+│ wfStatusId              │     └─────────────────────────┘
+│ slaDateTime             │
+│ isDedupCheck            │     ┌─────────────────────────┐
+│ addedUserId             │     │  il_counter              │
+│ addedDateTime           │     │─────────────────────────│
+└─────────────────────────┘     │ tenantId                │
+                                │ listId                  │
+                                │ counter (auto-increment)│
+                                └─────────────────────────┘
+```
+
+---
+
+## Technology Stack
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Runtime & Build                                       │
+│  ├── Node.js 22 (Alpine)                               │
+│  ├── ESBuild (ESM bundling)                            │
+│  └── Docker (multi-stage build)                        │
+│                                                        │
+│  Databases                                             │
+│  ├── PostgreSQL (pg driver + Sequelize ORM)            │
+│  └── MongoDB (Mongoose ODM, TLS, screenDB)             │
+│                                                        │
+│  Cloud Services (via Facctum Core Adapters)             │
+│  ├── AWS S3 (file storage)                             │
+│  ├── NATS (message queue for audit logs)               │
+│  └── AWS Secrets Manager                               │
+│                                                        │
+│  Libraries                                             │
+│  ├── ExcelJS (streaming Excel parsing)                 │
+│  ├── xlsx-js-style (error report generation)           │
+│  ├── Axios (HTTP calls to other services)              │
+│  ├── Moment.js (date handling)                         │
+│  └── @facctum-core/facctum-core-adapters (v2.2.28)     │
+│                                                        │
+│  Memory Management                                     │
+│  ├── --expose-gc (manual garbage collection)           │
+│  ├── --max-old-space-size=750 (heap limit)             │
+│  └── Streaming Excel reads (ignoreNodes optimization)  │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deployment Model
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Kubernetes (facctlist namespace)                         │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  facctlist-api-service (long-running)               │  │
+│  │  Receives bulk upload request from UI               │  │
+│  │  ──▶ Uploads Excel to S3                            │  │
+│  │  ──▶ Creates job_run_status record (PG)             │  │
+│  │  ──▶ Spawns K8s Job with JOB_ID env var             │  │
+│  └────────────────────────────────────────────────────┘  │
+│                          │                               │
+│                          ▼                               │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  facctlist-bulk-service (K8s Job — ephemeral)       │  │
+│  │                                                    │  │
+│  │  ConfigMap: facctlist-bulk-service-config           │  │
+│  │  ECR: facctlist/facctlist-bulk-service              │  │
+│  │                                                    │  │
+│  │  Lifecycle:                                        │  │
+│  │  1. Start → Init DB connections                    │  │
+│  │  2. Process bulk upload pipeline                   │  │
+│  │  3. Exit (process.exit(0))                         │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
+│  Related Services:                                       │
+│  ├── facctlist-api-service (triggers jobs)                │
+│  ├── facctum-case-manager (workflow initiation)           │
+│  ├── facctum-notification-service (email/push alerts)     │
+│  └── facctum-audit-service (consumes NATS audit events)   │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Key Design Patterns
+
+| Pattern | Implementation |
+|---|---|
+| Event-Driven Pipeline | `BulkUploadMediator` extends `EventEmitter`, uses a `Stack`-based FSM to sequence processors |
+| Mediator Pattern | Central mediator coordinates all processors, holds shared state via `setData`/`getData` |
+| Transaction Management | MongoDB sessions with explicit commit/abort; rollback on any pipeline failure |
+| Chunked Processing | Workflow initiation batches records in chunks of 100 to avoid payload limits |
+| Memory Optimization | Streaming Excel reads, `--expose-gc`, `ignoreNodes` for ExcelJS, 750MB heap cap |
+| Config-Driven Validation | All field validation rules loaded from `tenant_attribute_config` at runtime |
+| Error Recovery | Error report Excel generated and uploaded to S3; job status updated to FAILED |
+| Short-Lived Job | Runs to completion and exits — no HTTP server, no long-running process |
