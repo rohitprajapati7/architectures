@@ -2,7 +2,8 @@
 
 ## Service Overview
 
-**facctlist-bulk-service** is an event-driven, short-lived background processor (not a REST API) that handles bulk upload operations for FacctList internal lists (Blocklists and Press Release lists). It is spawned as a Kubernetes Job per bulk upload request, processes an Excel file from S3, validates/deduplicates records, persists them to databases, initiates approval workflows, and exits.
+**facctlist-bulk-service** is an event-driven, short-lived background processor (not a REST API) that handles bulk upload operations for FacctList internal lists (Blocklists and Press Release lists). 
+It is spawned as a Kubernetes Job per bulk upload request, processes an Excel file from S3, validates/deduplicates records, persists them to databases, initiates approval workflows, and exits.
 
 ---
 
