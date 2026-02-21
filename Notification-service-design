@@ -1,0 +1,121 @@
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        FACCTUM NOTIFICATION SERVICE                                 │
+│                        (Node.js / Express / ESM)                                    │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────┐
+                              │  API Clients  │
+                              └──────┬───────┘
+                                     │  HTTP
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                 ▼
+          ┌─────────────┐  ┌──────────────┐  ┌──────────────┐
+          │  Main App   │  │ Internal App │  │   /health    │
+          │  :PORT      │  │ :INTERNAL_PORT│  │  (liveness)  │
+          └──────┬──────┘  └──────┬───────┘  └──────────────┘
+                 │                │
+                 └───────┬────────┘
+                         ▼
+              ┌─────────────────────┐
+              │   Middleware Stack   │
+              │  ┌────────────────┐ │
+              │  │ helmet / xss   │ │
+              │  │ mongo-sanitize │ │
+              │  │ compression    │ │
+              │  │ internalAuth   │ │  ◄── Bearer token validation
+              │  │ requestLogger  │ │
+              │  │ responseHandler│ │
+              │  │ errorHandler   │ │
+              │  └────────────────┘ │
+              └──────────┬──────────┘
+                         │
+            ┌────────────┼────────────┐
+            ▼                         ▼
+   ┌────────────────┐      ┌──────────────────┐
+   │ POST /v1/notify│      │ POST /v1/publish │
+   │ (notification  │      │ (generic NATS    │
+   │  controller)   │      │  publisher)      │
+   └───────┬────────┘      └──────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                            NATS JETSTREAM                                           │
+│                                                                                     │
+│  ┌─────────────────────┐                                                            │
+│  │  NOTIFICATION Stream │ ◄── notification.queue.producer.writeReqToStream()        │
+│  └──────────┬──────────┘                                                            │
+│             │                                                                       │
+│             ▼                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────┐         │
+│  │  notification.queue.consumer  →  notificaion.processor                 │         │
+│  │                                                                        │         │
+│  │  1. Validate input event (Joi)                                         │         │
+│  │  2. Log event to eventlogdtl table                                     │         │
+│  │  3. Fetch event config from eventref table                             │         │
+│  │  4. Enrich data (input payload + CAP API user lists)                   │         │
+│  │  5. Route to delivery channels ──────────────────────┐                 │         │
+│  └──────────────────────────────────────────────────────┼─────────────────┘         │
+│                                                         │                           │
+│             ┌───────────────────┬────────────────────────┤                           │
+│             ▼                   ▼                        ▼                           │
+│  ┌──────────────────┐ ┌─────────────────┐  ┌────────────────────┐                   │
+│  │  EMAIL Stream    │ │  INAPP Stream   │  │  WEBHOOK Stream    │                   │
+│  └────────┬─────────┘ └───────┬─────────┘  └──────────┬─────────┘                   │
+│           │                   │                        │                             │
+└───────────┼───────────────────┼────────────────────────┼─────────────────────────────┘
+            │                   │                        │
+            ▼                   ▼                        ▼
+ ┌────────────────────┐ ┌───────────────────┐ ┌──────────────────────┐
+ │  EMAIL CHANNEL     │ │  INAPP CHANNEL    │ │  WEBHOOK CHANNEL     │
+ │                    │ │                   │ │                      │
+ │ email.event.       │ │ inapp.event.      │ │ webhook.event.       │
+ │   consumer         │ │   consumer        │ │   listner            │
+ │  (batch polling)   │ │  (stream consume) │ │  (stream consume)    │
+ │       │            │ │       │           │ │       │              │
+ │       ▼            │ │       ▼           │ │       ▼              │
+ │ email.template.    │ │ Handlebars compile│ │ webhook.processor    │
+ │   processor        │ │ in-app message    │ │       │              │
+ │  ┌─────────────┐   │ │       │           │ │       ├──────────┐   │
+ │  │ Fetch from  │   │ │       ▼           │ │       ▼          │   │
+ │  │ S3 (cached) │   │ │ Bulk insert to   │ │ webhook.template  │   │
+ │  │ - header    │   │ │ inappnotification│ │ (S3 + Handlebars) │   │
+ │  │ - body      │   │ │ table            │ │       │          │   │
+ │  │ - footer    │   │ │                   │ │       ▼          │   │
+ │  └─────────────┘   │ │                   │ │ webhook.         │   │
+ │       │            │ │                   │ │  authentication  │   │
+ │       ▼            │ │                   │ │ (Basic/OAuth/    │   │
+ │ Handlebars compile │ │                   │ │  HMAC)           │   │
+ │ + attachments      │ │                   │ │       │          │   │
+ │       │            │ │                   │ │       ▼          │   │
+ │       ▼            │ │                   │ │ HTTP POST with   │   │
+ │  AWS SES / SMTP    │ │                   │ │ exponential      │   │
+ │  send email        │ │                   │ │ backoff retry    │   │
+ └────────┬───────────┘ └────────┬──────────┘ └──────┬───────────┘
+          │                      │                    │
+          └──────────┬───────────┴────────────────────┘
+                     ▼
+          ┌─────────────────────┐
+          │  notificationlogdtl │  ◄── All channels track delivery status
+          │  (audit/tracking)   │
+          └─────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          EXTERNAL SERVICES                                          │
+│                                                                                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │PostgreSQL│  │ AWS S3   │  │ AWS SES  │  │ AWS Secrets  │  │  CAP Platform    │  │
+│  │          │  │          │  │  / SMTP  │  │   Manager    │  │  API             │  │
+│  │ Tables:  │  │ Stores:  │  │          │  │              │  │                  │  │
+│  │-eventref │  │-email    │  │ Sends    │  │ Webhook      │  │ - User lists     │  │
+│  │-eventlog │  │ templates│  │ emails   │  │ credentials  │  │ - User details   │  │
+│  │ dtl      │  │-webhook  │  │          │  │ (Basic Auth) │  │ - Email lookups  │  │
+│  │-notifica │  │ templates│  │          │  │              │  │                  │  │
+│  │ tionlog  │  │-attach-  │  │          │  │              │  │                  │  │
+│  │ dtl      │  │ ments    │  │          │  │              │  │                  │  │
+│  │-inapp    │  │          │  │          │  │              │  │                  │  │
+│  │ notifica │  │          │  │          │  │              │  │                  │  │
+│  │ tion     │  │          │  │          │  │              │  │                  │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────┘  └──────────────────┘  │
+│                                                                                     │
+│  All tables live in PostgreSQL under "cap_schema"                                   │
+└─────────────────────────────────────────────────────────────────────────────────────┘
