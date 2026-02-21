@@ -1,0 +1,190 @@
+What This Service Is
+This is a multi-tenant workflow orchestration manager that acts as a control plane between your internal microservices and Argo Workflows (running on Kubernetes). It manages the lifecycle of both ad-hoc and scheduled (cron) workflows for the Facctum platform, which appears to be a compliance/screening/watchlist product suite (FacctList, FacctView, FacctShield, etc.).
+
+Current Architecture
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          WORKFLOW MANAGER SERVICE                              │
+│                        (Node.js / Express / ESM)                                │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                        INGRESS LAYER                                     │   │
+│  │                                                                          │   │
+│  │  Internal Express App (:INTERNAL_PORT)                                   │   │
+│  │  ├── helmet, compression, mongo-sanitize                                 │   │
+│  │  ├── internalAuth middleware (Basic Auth + x-tenant-id header)            │   │
+│  │  ├── pgClientMiddleware (per-request PG client from pool)                │   │
+│  │  │                                                                       │   │
+│  │  ├── /v1/health          → Health check                                  │   │
+│  │  ├── /v1/workflow/       → Workflow CRUD (ad-hoc)                        │   │
+│  │  │   ├── GET /                    → list all workflows                   │   │
+│  │  │   ├── GET /:workflowName       → get specific workflow                │   │
+│  │  │   ├── POST /create             → create single workflow               │   │
+│  │  │   ├── POST /bulk               → create bulk workflows               │   │
+│  │  │   ├── POST /subscription       → register update-based subscription   │   │
+│  │  │   └── PUT  /update-subscription→ update subscription status           │   │
+│  │  │                                                                       │   │
+│  │  └── /v1/cron/           → CronWorkflow CRUD (scheduled)                │   │
+│  │      ├── GET /                    → list all cron workflows              │   │
+│  │      ├── GET /:workflowName       → get specific cron workflow           │   │
+│  │      ├── POST /create             → create cron workflow                 │   │
+│  │      ├── POST /bulk               → create bulk cron workflows           │   │
+│  │      ├── PUT  /update             → update cron workflow                 │   │
+│  │      ├── PUT  /updateOnChange     → update all CWs when template changes │   │
+│  │      ├── PUT  /:name/suspend      → suspend cron workflow                │   │
+│  │      ├── PUT  /:name/resume       → resume cron workflow                 │   │
+│  │      └── DELETE /:name            → delete cron workflow                 │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                     EVENT CONSUMERS (NATS JetStream)                     │   │
+│  │                                                                          │   │
+│  │  ┌─────────────────────────┐  ┌──────────────────────────────────────┐  │   │
+│  │  │ Store Refresh Consumer  │  │ Notification Event Consumer          │  │   │
+│  │  │ (STORE_REFRESH stream)  │  │ (NOTIFICATION stream)               │  │   │
+│  │  │                         │  │                                      │  │   │
+│  │  │ Subjects:               │  │ Triggers update-based workflow       │  │   │
+│  │  │ • storeQueue            │  │ subscriptions when notification      │  │   │
+│  │  │   → FacctView store     │  │ events arrive (e.g., list updated)  │  │   │
+│  │  │     creation v1 + v2    │  │                                      │  │   │
+│  │  │ • facctshieldStoreQueue │  │ Also triggers analytics workflows   │  │   │
+│  │  │   → FacctShield store   │  │ for specific event IDs (10,32,86)   │  │   │
+│  │  │     creation v1 + v2    │  │                                      │  │   │
+│  │  └─────────────────────────┘  └──────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                     CRON JOBS (in-process)                               │   │
+│  │                                                                          │   │
+│  │  Argo CronWorkflow Sync Job (configurable cron expression)               │   │
+│  │  ├── syncArgoCronWorkflowsWithDB()                                       │   │
+│  │  │   Compares DB schedules ↔ Argo CronWorkflows per namespace            │   │
+│  │  │   • Creates missing CWs in Argo (present in DB, absent in Argo)       │   │
+│  │  │   • Deletes orphan CWs in Argo (present in Argo, absent in DB)        │   │
+│  │  │                                                                       │   │
+│  │  └── getMissedCronWorkflowService()                                      │   │
+│  │      Detects missed scheduled runs (30-min window)                       │   │
+│  │      • Checks Argo for actual workflow execution                         │   │
+│  │      • Sends alert emails via NATS → Notification service                │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                     SERVICE LAYER                                        │   │
+│  │                                                                          │   │
+│  │  workflow.service.js         → Ad-hoc workflow creation via Argo API     │   │
+│  │  cronworkflow.service.js     → Full CRUD lifecycle for CronWorkflows     │   │
+│  │  syncCronWorkflows.service   → DB ↔ Argo reconciliation                 │   │
+│  │  missedCronWorkflow.service  → Missed run detection                     │   │
+│  │  checkWorkflowStatus.service → Argo status verification + alerting      │   │
+│  │  handleListRunSchedule       → List ingestion email alerts              │   │
+│  │  handleTemplateRunSchedule   → Template run email alerts                │   │
+│  │  utils.js                    → Template loading (S3/file), response     │   │
+│  │                                construction, cron parsing               │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                     DATA LAYER                                           │   │
+│  │                                                                          │   │
+│  │  PostgresModelCreator (custom lightweight ORM)                           │   │
+│  │  ├── find / insert / update / delete / executeQuery                      │   │
+│  │  │                                                                       │   │
+│  │  │  Tables (cap_schema):                                                 │   │
+│  │  │  ├── tenantjobeventconfig    → Template config per tenant/event       │   │
+│  │  │  ├── tenantjobeventschedule  → Schedule state (cron + update-based)   │   │
+│  │  │  └── tenantnotifytojobevent  → Event-to-job mapping for subscriptions │   │
+│  │  │                                                                       │   │
+│  │  │  Tables (scrn schema):                                                │   │
+│  │  │  └── watchlistref            → Watchlist reference data               │   │
+│  │  │                                                                       │   │
+│  │  └── screenTypeMaster (template) → Screen type metadata                  │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              EXTERNAL DEPENDENCIES
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Argo Workflow │  │  PostgreSQL   │  │ NATS JetStream│  │  S3 (Templates) │   │
+│  │   Server      │  │  (cap_schema, │  │  (Messaging)  │  │  Argo workflow  │   │
+│  │               │  │   scrn)       │  │               │  │  YAML templates │   │
+│  │ REST API:     │  │               │  │ Streams:      │  │                 │   │
+│  │ • /api/v1/    │  │ Source of     │  │ • STORE_REFRESH│ │  Loaded via     │   │
+│  │   workflows/  │  │ truth for     │  │ • NOTIFICATION│  │  facctum-core-  │   │
+│  │ • /api/v1/    │  │ schedule      │  │               │  │  adapters       │   │
+│  │   cron-       │  │ config &      │  │ Publishes:    │  │  storage svc    │   │
+│  │   workflows/  │  │ state         │  │ • Email events│  │                 │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │  @facctum-core/facctum-core-adapters (shared SDK)                        │   │
+│  │  ├── config()          → Centralized config bootstrap                    │   │
+│  │  ├── logger            → CloudWatch-backed logging                       │   │
+│  │  ├── queueService      → NATS JetStream abstraction                     │   │
+│  │  ├── postgresDB        → Connection pool management                     │   │
+│  │  ├── storageService    → S3 template fetching                           │   │
+│  │  └── nodeMiddleware    → pgClientMiddleware                              │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────┐  ┌──────────────────────────────────────────────────────┐    │
+│  │  Kubernetes   │  │  FacctList Internal API                              │    │
+│  │  Service Acct │  │  (FL_INTERNAL_URL)                                   │    │
+│  │  Token        │  │  Used for cross-service auth                         │    │
+│  │  (Argo auth)  │  │                                                      │    │
+│  └──────────────┘  └──────────────────────────────────────────────────────┘    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+Data Flow Summary
+                    ┌─────────────────────────────────┐
+                    │     Trigger Sources              │
+                    │                                  │
+                    │  1. API Request (internal svc)   │
+                    │  2. NATS Event (store refresh)   │
+                    │  3. NATS Event (notification)    │
+                    │  4. Cron Job (sync/missed check) │
+                    └──────────┬──────────────────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Resolve Template    │
+                    │  (DB: tenantjob-     │
+                    │   eventconfig)       │
+                    │  tenant + event_type │
+                    │  → template name +   │
+                    │    version           │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Load Template YAML  │
+                    │  (S3 or local file)  │
+                    │  Apply Handlebars    │
+                    │  parameter injection │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Validate against    │
+                    │  Argo API (lint)     │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Submit to Argo      │
+                    │  Workflows API       │
+                    │  (POST/PUT/DELETE)   │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Persist state in    │
+                    │  PostgreSQL          │
+                    │  (schedules table)   │
+                    └──────────────────────┘
+Key Architectural Observations
+What's working well:
+
+Clean separation of routes → controllers → services → repositories → models
+Multi-tenant by design (x-tenant-id header, per-tenant template config)
+DB ↔ Argo reconciliation via sync job is a solid resilience pattern
+Missed workflow detection with email alerting is a nice operational safety net
+The PostgresModelCreator is a lightweight but functional query builder
